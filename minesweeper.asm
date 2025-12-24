@@ -7,19 +7,21 @@ includelib msvcrt.lib
 include kernel32.inc
 includelib kernel32.lib
 
-printf PROTO C:ptr sbyte,:VARARG
-
+printf PROTO C:PTR SBYTE,:VARARG
+scanf PROTO C:PTR SBYTE,:VARARG
 .stack 4096
 
 .data
 board_width BYTE 10 ;棋盘宽度
 board_height BYTE 10 ;棋盘高度
 mine_count BYTE 10 ;地雷数量
-
-largeVal QWORD 0              ; 用于存储查询的高精度计数器值
+mines_left BYTE 10 ;剩余地雷数量
+cells_left BYTE 90 ;剩余未打开格子数量,每翻开一个非雷格子减1,游戏胜利条件:cells_left=0
 
 board_grid BYTE 400 DUP(0); ;棋盘格子数据,每个格子4字节 
 game_state BYTE 0 ;0-未开始 1-进行中 2-失败 3-胜利
+
+largeVal QWORD 0              ; 用于存储查询的高精度计数器值
 
 szMsg BYTE "Welcome to Minesweeper!",0ah,0
 MsgSeed BYTE "Random Seed is %d",0ah,0
@@ -34,6 +36,22 @@ MsgNewLine BYTE 0ah,0
 MsgCell_info_mid BYTE "%d %d %d %d,",0
 MsgCell_info_end BYTE "%d %d %d %d",0   ;放在最后一个不加逗号
 
+
+;输入输出相关数据
+;get_cell_state相关数据
+MsgInputPrompt BYTE "Input: Op(1=Click, 2=Flag) Row Col: ",0
+InputFormat BYTE "%d %d %d",0
+input_op DWORD ?
+input_x DWORD ?
+input_y DWORD ?
+MsgOutputCellState BYTE "Cell(%d,%d) State : %08X",0ah,0
+
+
+
+
+;游戏结束语
+MsgGameOver_fail BYTE "BOOM! You hit a mine! Game Over.",0ah , 0
+MsgGameOver_win BYTE "Congratulations! You cleared all the mines!",0ah , 0
 
 
 seed DWORD ? ;随机数种子
@@ -419,6 +437,213 @@ after_print:
     RET
 get_game_state ENDP
 
+;获取指定格子的状态
+;参数: x-行号(0-9), y-列号(0-9)
+;返回值: EAX-格子的4字节状态数据
+;   BYTE 0: 是否有地雷(1-有,0-无)
+;   BYTE 1: 是否打开(1-打开,0-未打开)
+;   BYTE 2: 是否插旗(1-插旗,0-未插旗)
+;   BYTE 3: 周围地雷数(0-8)
+get_cell_state PROC x:DWORD, y:DWORD
+    ; 计算偏移量 offset = x * 40 + y * 4
+    ; x 是行号，每行 40 BYTE
+    ; y 是列号，一个格子 4 BYTE
+
+    MOV EAX, x      ; EAX = 行号
+    IMUL EAX, 40    ; EAX = 行号 * 40
+
+    MOV ECX, y      ; ECX = 列号
+    IMUL ECX , 4    ; ECX = 列号 * 4
+
+    ADD EAX, ECX    ; EAX = offset
+
+    MOV EDX, OFFSET board_grid  ; board_grid 基址
+    MOV EAX, [EDX + EAX]        ; EAX = board_grid[offset]
+
+    RET
+get_cell_state ENDP
+
+;递归展开空白区域
+;参数: x-行号(0-9), y-列号(0-9)
+expand_blank PROC USES EBX ESI EDI x:DWORD, y:DWORD
+    LOCAL i:DWORD, j:DWORD
+
+    ;1. 边界检查(0~9)
+    CMP x, 0
+    JL ret_expand
+    CMP x, 9
+    JG ret_expand
+    CMP y, 0
+    JL ret_expand
+    CMP y, 9
+    JG ret_expand
+
+    ;2. 计算地址并获取指针
+    MOV EAX, x
+    IMUL EAX, 40
+    MOV ECX, y
+    IMUL ECX, 4
+    ADD EAX, ECX        ;EAX = offset
+    MOV ESI, OFFSET board_grid ;board_grid基址
+    ADD ESI, EAX        ;ESI = &board_grid[offset]
+
+    ;3. 检查是否已打开
+    ;如果已翻开(第2个字节=1)或已插旗(第3个字节=1),则跳过
+    MOV AL, [ESI + 1]   ;Open byte
+    CMP AL, 1
+    JE ret_expand
+    MOV AL, [ESI + 2]   ;Flag byte
+    CMP AL, 1
+    JE ret_expand
+
+    ;4. 翻开当前格子(第2个字节=1)
+    MOV BYTE PTR [ESI + 1], 1
+
+    ;=== 更新剩余格子数 ===
+    DEC cells_left
+    CMP cells_left, 0
+    JNE check_around_mines
+    ;如果剩余格子数为0，设置游戏状态为胜利
+    MOV game_state, 3
+    JMP ret_expand
+
+check_around_mines:
+    ;5. 检查周围雷数(第三个字节)
+    ; 如果周围有雷(>0)，则停止扩散(只翻开边界上的数字格)
+    MOV AL, [ESI + 3]
+    CMP AL, 0
+    JNE ret_expand
+
+    ;6. 如果周围无雷(=0)，递归展开8个方向,一列一列地展开
+    MOV i, -1
+loop_i:
+    MOV j, -1
+loop_j:
+    ;跳过(0,0)自己
+    CMP i, 0
+    JNE do_recurse
+    CMP j, 0
+    JE next_j   ;跳过自己
+
+do_recurse:
+    ;计算邻居坐标并递归调用
+    MOV EAX, x
+    ADD EAX, i
+    MOV EBX, y
+    ADD EBX, j
+    ;递归调用
+    INVOKE expand_blank, EAX, EBX
+
+next_j:
+    INC j
+    CMP j, 1
+    JLE loop_j
+
+    INC i
+    CMP i, 1
+    JLE loop_i
+
+ret_expand:
+    RET
+expand_blank ENDP
+
+
+; 点开格子逻辑
+; 参数: x-行号(0-9), y-列号(0-9)
+click_cell PROC x:DWORD, y:DWORD
+    ;1. 边界检查(0~9)
+    CMP x, 0
+    JL ret_click
+    CMP x, 9
+    JG ret_click
+    CMP y, 0
+    JL ret_click
+    CMP y, 9
+    JG ret_click
+
+    ;2. 计算地址并获取指针
+    MOV EAX, x
+    IMUL EAX, 40
+    MOV ECX, y
+    IMUL ECX, 4
+    ADD EAX, ECX        ;EAX = offset
+    MOV EDX, OFFSET board_grid ;board_grid基址
+    ADD EDX, EAX        ;EDX = &board_grid[offset]
+
+    ;3. 检查状态,是否插旗或已翻开
+    MOV AL, [EDX + 2]   ;Flag byte
+    CMP AL, 1
+    JE ret_click      ;有旗子，不能点开
+    MOV AL, [EDX + 1]   ;Open byte
+    CMP AL, 1
+    JE ret_click      ;已翻开，不能点开
+
+
+    ;4. 检查是否有地雷
+    MOV AL, [EDX]     ;Mine byte
+    CMP AL, 1
+    JE hit_mine
+
+    ;5. 安全,调用 expand_blank 递归展开
+    INVOKE expand_blank, x, y
+    JMP ret_click
+
+hit_mine:
+    ;设置游戏状态为失败
+    MOV BYTE PTR game_state, 2
+
+ret_click:
+    RET
+click_cell ENDP
+
+
+; 插旗/取消旗
+; 参数: x-行号(0-9), y-列号(0-9)
+toggle_flag PROC x:DWORD, y:DWORD
+    ;1. 边界检查(0~9)
+    CMP x, 0
+    JL ret_flag
+    CMP x, 9
+    JG ret_flag
+    CMP y, 0
+    JL ret_flag
+    CMP y, 9
+    JG ret_flag
+
+    ;2. 计算地址并获取指针
+    MOV EAX, x
+    IMUL EAX, 40
+    MOV ECX, y
+    IMUL ECX, 4
+    ADD EAX, ECX        ;EAX = offset
+    MOV EDX, OFFSET board_grid ;board_grid基址
+    ADD EDX, EAX        ;EDX = &board_grid[offset]
+
+    ;3. 检查是否已翻开(第2个字节),已翻开不能插旗
+    MOV AL , [EDX + 1]
+    CMP AL, 1
+    JE ret_flag
+
+    ;4. 切换旗子状态(第3个字节)
+    MOV AL, [EDX + 2]
+    CMP AL, 1
+    JE remove_flag
+
+    ;插旗
+    MOV BYTE PTR [EDX +2], 1  ;设置插旗标志
+    DEC mines_left            ;剩余地雷数减1
+    JMP ret_flag
+
+remove_flag:
+    ;取消旗
+    MOV BYTE PTR [EDX +2], 0  ;取消插旗标志
+    INC mines_left          ;剩余地雷数加1
+
+
+ret_flag:
+    RET
+toggle_flag ENDP
+
 start:
 
     ;INVOKE printf,OFFSET szMsg
@@ -433,11 +658,52 @@ start:
     ;INVOKE printf,OFFSET MsgTest_random_mod_100,location
 
     INVOKE r_places_mines
-
-    ;MOV EAX, OFFSET board_grid
-    ;MOV BYTE PTR [EAX + 3], 1
     INVOKE calc_around_mines
+    MOV game_state, 1 ;设置游戏状态为进行中
+
+    MOV cells_left, 90 ;初始化剩余格子数
 
     INVOKE get_game_state
+
+    INVOKE printf, OFFSET MsgNewLine
+
+game_loop:
+
+    ;1.提示用户输入格子坐标
+    INVOKE printf, OFFSET MsgInputPrompt
+    ;2.接受输入: 操作类型, 行, 列
+    INVOKE scanf, OFFSET InputFormat, OFFSET input_op, OFFSET input_x, OFFSET input_y
+
+    ;3 根据输入的操作执行相应函数
+    CMP input_op, 2
+    JE do_flag
+
+    ; 点击格子
+    INVOKE click_cell, input_x, input_y
+    JMP chech_state
+
+do_flag:
+    ; 插旗/取消旗
+    INVOKE toggle_flag, input_x, input_y
+
+chech_state:
+    ;4. 再次显示盘面（查看翻开效果）
+    INVOKE get_game_state
+
+    ;5.检查游戏状态
+    CMP game_state, 2
+    JE state_fail
+    CMP game_state, 3
+    JE state_win
+
+    JMP game_loop
+state_fail:
+    INVOKE printf, OFFSET MsgGameOver_fail
+    JMP game_over
+state_win:
+    INVOKE printf, OFFSET MsgGameOver_win
+    JMP game_over
+
+game_over:
     RET
 end start
